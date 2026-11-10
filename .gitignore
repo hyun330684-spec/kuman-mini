@@ -1,0 +1,12 @@
+.gradle/
+build/
+app/build/
+lib/build/
+local.properties
+*.iml
+.cxx/
+# Large model files are fetched via scripts/fetch-model.* (kept out of git)
+app/src/main/assets/models/*.gguf
+
+# Vendored upstream sources (fetch via scripts/fetch-thirdparty.*)
+third_party/
