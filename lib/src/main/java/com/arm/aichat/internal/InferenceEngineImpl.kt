@@ -103,6 +103,15 @@ internal class InferenceEngineImpl private constructor(
     @FastNative
     private external fun generateNextToken(): String?
 
+    /**
+     * Commit the assistant turn that was being streamed into the native chat
+     * history. Safe to call more than once per turn; the native side keeps the
+     * history balanced so the next prompt is not formatted against two user
+     * messages in a row.
+     */
+    @FastNative
+    private external fun finishAssistantTurn()
+
     @FastNative
     private external fun unload()
 
@@ -226,21 +235,30 @@ internal class InferenceEngineImpl private constructor(
         try {
             Log.i(TAG, "Sending user prompt...")
             _readyForSystemPrompt = false
+            // A cancel from the previous turn must not swallow this one.
+            _cancelGeneration = false
             _state.value = InferenceEngine.State.ProcessingUserPrompt
 
             processUserPrompt(message, predictLength).let { result ->
                 if (result != 0) {
                     Log.e(TAG, "Failed to process user prompt: $result")
+                    finishAssistantTurn()
                     return@flow
                 }
             }
 
             Log.i(TAG, "User prompt processed. Generating assistant prompt...")
             _state.value = InferenceEngine.State.Generating
-            while (!_cancelGeneration) {
-                generateNextToken()?.let { utf8token ->
-                    if (utf8token.isNotEmpty()) emit(utf8token)
-                } ?: break
+            try {
+                while (!_cancelGeneration) {
+                    generateNextToken()?.let { utf8token ->
+                        if (utf8token.isNotEmpty()) emit(utf8token)
+                    } ?: break
+                }
+            } finally {
+                // EOG / token budget already committed natively; this covers
+                // the cancelled and exception paths.
+                finishAssistantTurn()
             }
             if (_cancelGeneration) {
                 Log.i(TAG, "Assistant generation aborted per requested.")

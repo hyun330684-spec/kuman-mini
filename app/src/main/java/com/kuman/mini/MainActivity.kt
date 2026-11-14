@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.res.Configuration
+import android.graphics.BitmapFactory
 import android.location.LocationManager
 import android.net.Uri
 import android.os.Build
@@ -23,6 +24,7 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.addCallback
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.CameraSelector
@@ -54,7 +56,7 @@ import java.io.FileOutputStream
 import java.io.InputStream
 import java.util.UUID
 
-class MainActivity : AppCompatActivity() {
+class MainActivity : AppCompatActivity(), ImageStudioSheet.Listener {
 
     // Android views
     private lateinit var faceView: FaceView
@@ -96,6 +98,12 @@ class MainActivity : AppCompatActivity() {
     private val messages = mutableListOf<Message>()
     private val lastAssistantMsg = StringBuilder()
     private val messageAdapter = MessageAdapter(messages)
+
+    // Image studio (style presets / ratio / img2img) — the chosen options and
+    // the picked photo are kept here so the sheet can be reopened after the
+    // gallery picker without losing them.
+    private var studioState = StudioState()
+    private var studioPhoto: Bitmap? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -174,23 +182,18 @@ class MainActivity : AppCompatActivity() {
             startActivity(Intent(this, SettingsActivity::class.java))
         }
 
-        // Image generation is on hold: CPU-only SD-Turbo measured >10min
-        // per image on-device. Kept in code behind IMAGE_GEN_ENABLED.
-        imageBtn.visibility = if (IMAGE_GEN_ENABLED) View.VISIBLE else View.GONE
+        // Image studio: style presets, aspect ratio and photo-to-image
+        // conversion. Autotriggering from a chat message stays off (a surprise
+        // multi-minute generation), but the explicit button is the intended
+        // entry point.
+        imageBtn.visibility = if (IMAGE_STUDIO_ENABLED) View.VISIBLE else View.GONE
         imageBtn.setOnClickListener {
-            if (!IMAGE_GEN_ENABLED) return@setOnClickListener
-            if (!isModelReady) {
-                Toast.makeText(this, "모델 로딩 후 사용 가능합니다", Toast.LENGTH_SHORT).show()
+            if (imageGenJob?.isActive == true) {
+                imageGenerator.cancel()
+                Toast.makeText(this, "이미지 생성을 취소하고 있어요", Toast.LENGTH_SHORT).show()
                 return@setOnClickListener
             }
-            val prompt = userInputEt.text.toString().trim()
-            if (IMAGE_RE.containsMatchIn(prompt)) {
-                handleUserInput(prompt)
-            } else {
-                beginImageRequest(
-                    prompt.ifEmpty { "a cute robot character, friendly expression" }
-                )
-            }
+            openImageStudio()
         }
 
         applyTheme()
@@ -294,7 +297,7 @@ class MainActivity : AppCompatActivity() {
             userInputEt.visibility = View.VISIBLE
             userActionFab.visibility = View.VISIBLE
             micFab.visibility = View.VISIBLE
-            imageBtn.visibility = if (IMAGE_GEN_ENABLED) View.VISIBLE else View.GONE
+            imageBtn.visibility = if (IMAGE_STUDIO_ENABLED) View.VISIBLE else View.GONE
             inputRow.visibility = View.VISIBLE
         }
         faceView.requestLayout()
@@ -659,8 +662,8 @@ class MainActivity : AppCompatActivity() {
                 // Time/date questions are answered locally — nothing leaves the device
                 TIME_DATE_RE.containsMatchIn(userMsg) -> answerTimeDateLocally()
                 // Image generation request ("그려줘", "그림", ...)
-                IMAGE_GEN_ENABLED && IMAGE_RE.containsMatchIn(userMsg) ->
-                    handleImageRequest(userMsg)
+                IMAGE_AUTO_TRIGGER && IMAGE_RE.containsMatchIn(userMsg) ->
+                    launchStudioGeneration(studioState, userMsg, fromPhoto = false)
                 // Weather needs one external call: only the coordinates are sent
                 WEATHER_RE.containsMatchIn(userMsg) -> fetchWeatherThenGenerate(userMsg)
                 // Web search: only the question text is sent, never chat history
@@ -719,68 +722,196 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // ------------------------------------------------------------------
+    // Image studio: style presets, aspect ratio, photo-to-image (img2img)
+    // ------------------------------------------------------------------
+
+    private val pickStudioPhoto = registerForActivityResult(
+        ActivityResultContracts.PickVisualMedia()
+    ) { uri -> onStudioPhotoPicked(uri) }
+
     /**
-     * Image button entry point: same preamble as [handleUserInput]
-     * (user bubble + empty assistant placeholder), then generation.
+     * Open the image studio sheet. Reopened after the gallery picker so the
+     * previously chosen style, ratio and photo are all still there.
      */
-    private fun beginImageRequest(userMsg: String) {
-        if (userMsg.isEmpty()) return
+    private fun openImageStudio() {
+        if (!IMAGE_STUDIO_ENABLED) return
+        if (isFinishing || isDestroyed) return
+        if (!isModelReady) {
+            Toast.makeText(this, "모델 로딩 후 사용 가능합니다", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (imageGenJob?.isActive == true) {
+            Toast.makeText(this, "이미 생성을 진행 중이에요", Toast.LENGTH_SHORT).show()
+            return
+        }
+        ImageStudioSheet(this, studioState, studioPhoto, this).show()
+    }
+
+    override fun onStudioPickPhoto(state: StudioState) {
+        studioState = state
+        runCatching {
+            pickStudioPhoto.launch(
+                PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+            )
+        }.onFailure { e ->
+            Log.e(TAG, "Could not open the photo picker", e)
+            Toast.makeText(this, "사진을 고를 수 없어요", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    override fun onStudioGenerate(state: StudioState, fromPhoto: Boolean) {
+        studioState = state
+        if (imageGenJob?.isActive == true) {
+            Toast.makeText(this, "이미 생성을 진행 중이에요", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        val subject = userInputEt.text?.toString()?.trim().orEmpty()
         userInputEt.text = null
         userInputEt.isEnabled = false
         userActionFab.isEnabled = false
         micFab.isEnabled = false
-        imageBtn.isEnabled = false
+        // The image button stays live so a long run can be cancelled.
         stopListening()
         tts?.stop()
         ttsBuffer.clear()
         thinkFilter.reset()
 
-        messages.add(Message(UUID.randomUUID().toString(), userMsg, true))
+        val bubbleText = subject.ifBlank {
+            if (fromPhoto) "내 사진을 ${state.style.label} 스타일로" else "${state.style.label} 이미지"
+        }
+        messages.add(Message(UUID.randomUUID().toString(), bubbleText, true))
         lastAssistantMsg.clear()
         messages.add(Message(UUID.randomUUID().toString(), "", false))
         messageAdapter.notifyItemRangeInserted(messages.size - 2, 2)
         messagesRv.scrollToPosition(messages.size - 1)
 
-        handleImageRequest(userMsg)
+        launchStudioGeneration(state, subject, fromPhoto)
+    }
+
+    private fun onStudioPhotoPicked(uri: Uri?) {
+        if (uri == null) {
+            // Picker dismissed without a choice: just show the sheet again.
+            openImageStudio()
+            return
+        }
+        studioState = studioState.copy(photoUri = uri)
+        lifecycleScope.launch {
+            statusTv.text = "사진을 불러오는 중..."
+            val bitmap = decodeStudioPhoto(uri)
+            if (isModelReady) statusTv.text = "준비 완료! 말을 걸어보세요."
+            if (bitmap == null) {
+                Toast.makeText(this@MainActivity, "사진을 읽지 못했어요", Toast.LENGTH_SHORT).show()
+                studioState = studioState.copy(photoUri = null)
+            } else {
+                val old = studioPhoto
+                studioPhoto = bitmap
+                if (old != null && old !== bitmap && !old.isRecycled) old.recycle()
+            }
+            openImageStudio()
+        }
     }
 
     /**
-     * Image generation: translate the (usually Korean) request into an
-     * English SD prompt via the local LLM, then run SD-Turbo on-device.
-     * The user message + empty assistant placeholder were already added
-     * by [handleUserInput]; the placeholder becomes the image bubble.
+     * Decode a picked photo down to [ImageGenerator.MAX_DECODE_EDGE] so a
+     * 12MP gallery shot does not land in memory at full size before the
+     * centre-crop in [ImageGenerator.prepareSource].
      */
-    private fun handleImageRequest(userMsg: String) {
+    private suspend fun decodeStudioPhoto(uri: Uri): Bitmap? = withContext(Dispatchers.IO) {
+        try {
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
+            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return@withContext null
+
+            var sample = 1
+            while (bounds.outWidth / (sample * 2) >= ImageGenerator.MAX_DECODE_EDGE ||
+                bounds.outHeight / (sample * 2) >= ImageGenerator.MAX_DECODE_EDGE
+            ) {
+                sample *= 2
+            }
+            val opts = BitmapFactory.Options().apply {
+                inSampleSize = sample
+                inPreferredConfig = Bitmap.Config.ARGB_8888
+            }
+            contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, opts) }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to decode studio photo $uri", e)
+            null
+        }
+    }
+
+    /**
+     * Image generation: translate the (usually Korean) request into an English
+     * SD prompt via the local LLM, combine it with the chosen style preset,
+     * then run SD-Turbo on-device — text-to-image, or img2img when a photo was
+     * picked. The user message and empty assistant placeholder must already be
+     * in [messages]; the placeholder becomes the image bubble.
+     */
+    private fun launchStudioGeneration(state: StudioState, subject: String, fromPhoto: Boolean) {
         // Show progress inside the assistant bubble right away — the
         // pipeline (translate -> copy/load -> generate) can take minutes
         // on first run and must not look frozen.
         runCatching {
             val idx = messages.lastIndex
             if (idx >= 0 && !messages[idx].isUser) {
-                messages[idx] = messages[idx].copy(content = "🎨 이미지를 그리고 있어요…")
+                messages[idx] = messages[idx].copy(
+                    content = if (fromPhoto) "🖌 사진을 변환하고 있어요…" else "🎨 이미지를 그리고 있어요…"
+                )
                 messageAdapter.notifyItemChanged(idx)
             }
         }
         imageGenJob = lifecycleScope.launch {
             try {
-                statusTv.text = "영어 프롬프트로 변환하는 중..."
-                val enPrompt = translateToSdPrompt(userMsg)
-                    .ifEmpty { userMsg }
+                val subjectText = subject.ifBlank { state.style.fallbackSubject }
+                statusTv.text = "영어 프롬프트로 바꾸는 중..."
+                val english = translateToSdPrompt(subjectText)
+                    .ifBlank { subjectText }
+                val prompt = state.style.composePrompt(english.ifBlank { state.style.fallbackSubject })
+                Log.i(TAG, "Studio prompt: $prompt (style=${state.style.id}, " +
+                    "ratio=${state.ratio.label}, photo=$fromPhoto, strength=${state.strength})")
 
                 statusTv.text = "이미지 모델을 준비하는 중... (첫 실행 시 오래 걸립니다)"
-                val ready = imageGenerator.ensureModelLoaded()
-                if (!ready) {
-                    failImageMessage("이미지 모델을 불러오지 못했어요.")
+                if (!imageGenerator.ensureModelLoaded()) {
+                    failImageMessage(
+                        "이미지 모델을 불러오지 못했어요.\n" +
+                            "assets/models/${ImageGenerator.SD_MODEL_NAME} 파일을 확인해 주세요."
+                    )
                     return@launch
                 }
 
-                statusTv.text = "이미지 생성 중... (30초~1분 정도 걸려요)"
-                val bitmap = imageGenerator.generate(enPrompt)
+                val bitmap: Bitmap? = if (fromPhoto) {
+                    val photo = studioPhoto ?: studioState.photoUri?.let { decodeStudioPhoto(it) }
+                    if (photo == null) {
+                        failImageMessage("사진을 읽지 못했어요. 사진을 다시 골라 주세요.")
+                        return@launch
+                    }
+                    statusTv.text = "사진을 변환하는 중... (수 분 걸릴 수 있어요)"
+                    imageGenerator.generateFromPhoto(
+                        photo = photo,
+                        prompt = prompt,
+                        negative = SD_BASE_NEGATIVE,
+                        width = state.ratio.width,
+                        height = state.ratio.height,
+                        strength = state.strength,
+                        steps = (state.style.steps + 1).coerceAtMost(8)
+                    )
+                } else {
+                    statusTv.text = "이미지 생성 중... (수 분 걸릴 수 있어요)"
+                    imageGenerator.generate(
+                        prompt = prompt,
+                        negative = SD_BASE_NEGATIVE,
+                        width = state.ratio.width,
+                        height = state.ratio.height,
+                        steps = state.style.steps
+                    )
+                }
+
                 if (bitmap != null) {
                     val idx = messages.lastIndex
                     messages[idx] = Message(
                         messages[idx].id,
-                        enPrompt.take(80),
+                        "[${state.style.label}] ${prompt.take(120)}",
                         isUser = false,
                         bitmap = bitmap
                     )
@@ -925,7 +1056,10 @@ class MainActivity : AppCompatActivity() {
         private const val BUNDLED_MODEL_BYTES = 1644918272L
         private const val FILE_EXTENSION_GGUF = ".gguf"
         private const val REQ_AUDIO_PERMISSION = 1001
-        private const val IMAGE_GEN_ENABLED = false
+        /** Shows the image studio button and sheet. */
+        private const val IMAGE_STUDIO_ENABLED = true
+        /** "그려줘" inside a chat message starting a multi-minute job by surprise. */
+        private const val IMAGE_AUTO_TRIGGER = false
 
         private val REQUIRED_PERMISSIONS = arrayOf(
             Manifest.permission.RECORD_AUDIO,

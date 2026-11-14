@@ -1,5 +1,6 @@
 #include <android/log.h>
 #include <jni.h>
+#include <algorithm>
 #include <iomanip>
 #include <cmath>
 #include <codecvt>
@@ -268,6 +269,7 @@ constexpr const char *ROLE_ASSISTANT    = "assistant";
 static std::vector<common_chat_msg> chat_msgs;
 static llama_pos system_prompt_position;
 static llama_pos current_position;
+static llama_pos stop_generation_position;
 
 static void reset_long_term_states(const bool clear_kv_cache = true) {
     chat_msgs.clear();
@@ -288,10 +290,18 @@ static void reset_long_term_states(const bool clear_kv_cache = true) {
  */
 static void shift_context() {
     const int n_discard = (current_position - system_prompt_position) / 2;
+    if (n_discard <= 0) return;
     LOGi("%s: Discarding %d tokens", __func__, n_discard);
     llama_memory_seq_rm(llama_get_memory(g_context), 0, system_prompt_position, system_prompt_position + n_discard);
     llama_memory_seq_add(llama_get_memory(g_context), 0, system_prompt_position + n_discard, current_position, -n_discard);
     current_position -= n_discard;
+    // The stop marker is an absolute position ahead of the cursor, so the
+    // discarded span has to come off it too — otherwise a shifted context
+    // lets generation run past its token budget (the old "stuck" behaviour).
+    if (stop_generation_position > n_discard) {
+        stop_generation_position = std::max<llama_pos>(current_position,
+                                                       (llama_pos) (stop_generation_position - n_discard));
+    }
     LOGi("%s: Context shifting done! Current position: %d", __func__, current_position);
 }
 
@@ -312,14 +322,50 @@ static std::string chat_add_and_format(const std::string &role, const std::strin
  * - token chars caching
  * - current assistant message being generated
  */
-static llama_pos stop_generation_position;
 static std::string cached_token_chars;
 static std::ostringstream assistant_ss;
+
+static bool assistant_turn_committed = false;
 
 static void reset_short_term_states() {
     stop_generation_position = 0;
     cached_token_chars.clear();
     assistant_ss.str("");
+    assistant_turn_committed = false;
+}
+
+static std::string drain_utf8_cache(std::string &cache);
+
+/**
+ * Persist the assistant reply being streamed into the chat history.
+ *
+ * Every way a turn can end has to land here exactly once: the EOG token, the
+ * n_predict budget, a decode failure and a client-side cancel. Missing it on
+ * the budget/cancel paths used to leave two user turns in a row in
+ * [chat_msgs], so the next prompt was formatted against a history the model
+ * never saw the end of — the in-chat symptom was a dead second turn.
+ * Idempotent per turn; the flag is cleared by [reset_short_term_states].
+ */
+static void commit_assistant_turn(const char *reason) {
+    if (assistant_turn_committed) return;
+    assistant_turn_committed = true;
+
+    // Flush the complete part of whatever is left in the byte cache. An
+    // incomplete trailing UTF-8 sequence is dropped: it cannot be rendered.
+    const std::string tail = drain_utf8_cache(cached_token_chars);
+    if (!tail.empty()) {
+        assistant_ss << tail;
+    }
+
+    LOGi("%s: Committing assistant turn (%s), %d bytes",
+         __func__, reason, (int) assistant_ss.str().size());
+    if (chat_msgs.empty()) {
+        // Model without a chat template: no formatted history is kept, so
+        // there is nothing to balance and nothing to append.
+        LOGi("%s: Empty chat history, nothing to commit into", __func__);
+        return;
+    }
+    chat_add_and_format(ROLE_ASSISTANT, assistant_ss.str());
 }
 
 static int decode_tokens_in_batches(
@@ -452,9 +498,12 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_processUserPrompt(
         return 2;
     }
 
-    // Update position
-    current_position += user_prompt_size;
-    stop_generation_position = current_position + user_prompt_size + n_predict;
+    // Update position. Use the number of tokens actually decoded: the prompt
+    // may have been truncated above, and the old code added the pre-truncation
+    // size (and then added it a second time to the stop marker) which let a
+    // single reply overrun the whole context window.
+    current_position += (llama_pos) user_tokens.size();
+    stop_generation_position = current_position + std::max(1, (int) n_predict);
     return 0;
 }
 
@@ -523,6 +572,7 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_generateNextToken(
     // Stop if reaching the marked position
     if (current_position >= stop_generation_position) {
         LOGw("%s: STOP: hitting stop position: %d", __func__, stop_generation_position);
+        commit_assistant_turn("token budget reached");
         return nullptr;
     }
 
@@ -535,6 +585,7 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_generateNextToken(
     g_batch.add(new_token_id, current_position, 0, true);
     if (llama_process(g_context, LLAMA_PROCESS_TYPE_DECODE, g_batch.get()) != 0) {
         LOGe("%s: llama_decode() failed for generated token", __func__);
+        commit_assistant_turn("decode failed");
         return nullptr;
     }
 
@@ -544,7 +595,7 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_generateNextToken(
     // Stop if next token is EOG
     if (llama_vocab_is_eog(llama_model_get_vocab(g_model), new_token_id)) {
         LOGd("id: %d,\tIS EOG!\nSTOP.", new_token_id);
-        chat_add_and_format(ROLE_ASSISTANT, assistant_ss.str());
+        commit_assistant_turn("eog");
         return nullptr;
     }
 
@@ -568,6 +619,19 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_generateNextToken(
     return result;
 }
 
+
+/**
+ * Called by the Kotlin side once a generation loop has stopped for a reason
+ * the native code cannot see (the user cancelled, the collector stopped, an
+ * exception was raised). Keeps the assistant turn in the history so the next
+ * user prompt is formatted against a balanced conversation.
+ */
+extern "C"
+JNIEXPORT void JNICALL
+Java_com_arm_aichat_internal_InferenceEngineImpl_finishAssistantTurn(JNIEnv * /*unused*/, jobject /*unused*/) {
+    if (g_context == nullptr) return;
+    commit_assistant_turn("client finished");
+}
 
 extern "C"
 JNIEXPORT void JNICALL

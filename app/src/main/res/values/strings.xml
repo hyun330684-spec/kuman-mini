@@ -1,3 +1,18 @@
 <resources>
     <string name="app_name">쿠만 미니</string>
+
+    <!-- Image studio (style presets / ratio / img2img) -->
+    <string name="studio_title">이미지 스튜디오</string>
+    <string name="studio_style">스타일</string>
+    <string name="studio_ratio">비율</string>
+    <string name="studio_no_photo">사진을 고르면 내 사진으로 변환할 수 있어요</string>
+    <string name="studio_photo_ready">사진 준비됨 — 변환 강도를 고르세요</string>
+    <string name="studio_photo_preview">선택한 사진</string>
+    <string name="studio_pick_photo">사진 선택</string>
+    <string name="studio_strength">변환 강도</string>
+    <string name="studio_strength_value">변환 강도 %1$s</string>
+    <string name="studio_generate">그리기</string>
+    <string name="studio_convert">사진 변환</string>
+    <string name="studio_slow_hint">기기에서 직접 생성하므로 첫 실행은 수 분 걸릴 수 있어요.</string>
+    <string name="studio_need_model">이미지 모델을 먼저 준비해야 해요.</string>
 </resources>
